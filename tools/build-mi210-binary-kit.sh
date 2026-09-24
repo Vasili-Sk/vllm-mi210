@@ -224,7 +224,20 @@ with ZipFile(source) as src, ZipFile(
             name.startswith("aiter_meta/csrc/")
             and not name.endswith((".co", ".png", ".md", ".MD"))
         )
-        if (name.startswith("aiter_meta/") and not required_meta) or name == record_name:
+        foreign_config = (
+            name.startswith("aiter/ops/triton/configs/gfx")
+            and not name.startswith("aiter/ops/triton/configs/gfx90a/")
+        )
+        foreign_gluon = (
+            name.startswith("aiter/ops/triton/_gluon_kernels/gfx")
+            and not name.startswith("aiter/ops/triton/_gluon_kernels/gfx90a/")
+        )
+        if (
+            (name.startswith("aiter_meta/") and not required_meta)
+            or foreign_config
+            or foreign_gluon
+            or name == record_name
+        ):
             continue
         data = src.read(name)
         dst.writestr(item, data)
@@ -238,8 +251,53 @@ with ZipFile(source) as src, ZipFile(
     dst.writestr(record_name, rows.getvalue().encode())
 PY
 cp -a "$AITER_SITE/aiter/jit/"*.so "$STAGE/runtime/aiter/jit/"
+OBJCOPY_TOOL="$ROCM_PATH/llvm/bin/llvm-objcopy"
+BUNDLER_TOOL="$ROCM_PATH/lib/llvm/bin/clang-offload-bundler"
+[[ -x "$OBJCOPY_TOOL" ]] || die "ROCm llvm-objcopy does not exist: $OBJCOPY_TOOL"
+[[ -x "$BUNDLER_TOOL" ]] || die "ROCm clang-offload-bundler does not exist: $BUNDLER_TOOL"
+mkdir -p "$SCRATCH_DIR/aiter-fatbins"
 for module in "$STAGE/runtime/aiter/jit/"*.so; do
     "$STRIP_TOOL" --strip-debug "$module"
+    readelf -SW "$module" | grep -q ' \.hip_fatbin ' || continue
+    module_name=$(basename "$module")
+    module_work="$SCRATCH_DIR/aiter-fatbins/$module_name"
+    mkdir -p "$module_work"
+    "$OBJCOPY_TOOL" --dump-section ".hip_fatbin=$module_work/original.fatbin" "$module"
+    mapfile -t bundle_targets < <(
+        "$BUNDLER_TOOL" --type=o --input="$module_work/original.fatbin" --list
+    )
+    retained_targets=()
+    removed_target=0
+    for target in "${bundle_targets[@]}"; do
+        if [[ "$target" == *--gfx* && "$target" != *--gfx90a* ]]; then
+            removed_target=1
+        else
+            retained_targets+=("$target")
+        fi
+    done
+    ((removed_target)) || continue
+    ((${#retained_targets[@]})) || die "No target remained in $module_name."
+    target_csv=$(IFS=,; echo "${retained_targets[*]}")
+    unbundle_args=()
+    bundle_args=()
+    for index in "${!retained_targets[@]}"; do
+        part="$module_work/part-$index.o"
+        unbundle_args+=(--output="$part")
+        bundle_args+=(--input="$part")
+    done
+    "$BUNDLER_TOOL" --type=o --unbundle \
+        --input="$module_work/original.fatbin" \
+        --targets="$target_csv" "${unbundle_args[@]}"
+    "$BUNDLER_TOOL" --type=o "${bundle_args[@]}" \
+        --targets="$target_csv" --bundle-align=4096 \
+        --output="$module_work/gfx90a.fatbin"
+    "$OBJCOPY_TOOL" --update-section \
+        ".hip_fatbin=$module_work/gfx90a.fatbin" "$module"
+    if "$BUNDLER_TOOL" --type=o --input="$module_work/gfx90a.fatbin" --list \
+        | grep -E -- '--gfx' | grep -vq -- '--gfx90a'; then
+        die "A foreign GPU target remains in $module_name."
+    fi
+    printf 'Removed non-gfx90a device images from %s.\n' "$module_name"
 done
 cp -a "$AITER_SITE/aiter/ops/triton/configs/gfx90a" \
     "$STAGE/runtime/aiter/ops/triton/configs/"
@@ -352,7 +410,7 @@ Included files:
 
 - \`wheels/$VLLM_FILE\`: vLLM wheel compiled for gfx90a. ELF debug sections are removed.
 - \`wheels/$AITER_FILE\`: reduced AITER runtime. It keeps the import source and templates that AITER reads. It excludes bundled code objects, third-party build trees, heuristic models, and non-gfx90a data.
-- \`runtime/aiter\`: tested gfx90a AITER modules and configuration files.
+- \`runtime/aiter\`: tested AITER modules with non-gfx90a device images removed, plus gfx90a configuration files.
 - \`rankings/expert-ranking.json\`: tested static expert order.
 - \`install.sh\`: installer for an active Python 3.12 environment.
 - \`serve-flash-next-mi210.sh\`: generic one-MI210 server launcher.
@@ -390,7 +448,7 @@ Requested package version: $PACKAGE_VERSION
 vLLM wheel: wheels/$VLLM_FILE
 AITER wheel: wheels/$AITER_FILE
 AITER wheel: bundled code objects, third-party build trees, heuristics, and unused aiter_meta removed
-AITER runtime: prebuilt top-level JIT modules and gfx90a Triton configurations
+AITER runtime: prebuilt top-level JIT modules with only gfx90a device images, plus gfx90a Triton configurations
 Expert ranking: rankings/expert-ranking.json
 EOF
 
