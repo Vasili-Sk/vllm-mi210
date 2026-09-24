@@ -115,6 +115,8 @@ if [[ -z "$VLLM_WHEEL" ]]; then
         "CMAKE_PREFIX_PATH=$ROCM_PATH"
         VLLM_TARGET_DEVICE=rocm
         PYTORCH_ROCM_ARCH=gfx90a
+        CMAKE_BUILD_TYPE=Release
+        CARGO_PROFILE_RELEASE_STRIP=symbols
         "MAX_JOBS=$JOBS"
         "TRITON_KERNELS_SRC_DIR=$TRITON_KERNELS_SRC_DIR"
         "$BUILD_PYTHON" -m pip wheel --no-build-isolation --no-deps
@@ -137,7 +139,59 @@ fi
 
 STAGE="$SCRATCH_DIR/stage/$KIT_NAME"
 mkdir -p "$STAGE"/{wheels,runtime/aiter/jit,runtime/aiter/ops/triton/configs,rankings,licenses}
-cp -a "$VLLM_WHEEL" "$STAGE/wheels/"
+STRIP_TOOL="$ROCM_PATH/llvm/bin/llvm-strip"
+[[ -x "$STRIP_TOOL" ]] || die "ROCm llvm-strip does not exist: $STRIP_TOOL"
+STRIPPED_VLLM_WHEEL="$STAGE/wheels/$(basename "$VLLM_WHEEL")"
+"$BUILD_PYTHON" - "$VLLM_WHEEL" "$STRIPPED_VLLM_WHEEL" "$STRIP_TOOL" <<'PY'
+from base64 import urlsafe_b64encode
+import csv
+from hashlib import sha256
+from io import StringIO
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from zipfile import ZIP_DEFLATED, ZipFile
+
+source, output, strip_tool = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+records = []
+stripped = []
+with ZipFile(source) as src, ZipFile(
+    output, "w", compression=ZIP_DEFLATED, compresslevel=6
+) as dst, tempfile.TemporaryDirectory(dir=output.parent) as temporary:
+    record_names = [
+        item.filename
+        for item in src.infolist()
+        if item.filename.endswith(".dist-info/RECORD")
+    ]
+    if len(record_names) != 1:
+        raise SystemExit("The vLLM wheel must contain one RECORD file.")
+    record_name = record_names[0]
+    for index, item in enumerate(src.infolist()):
+        name = item.filename
+        if name == record_name:
+            continue
+        data = src.read(name)
+        if data.startswith(b"\x7fELF"):
+            path = Path(temporary) / str(index)
+            path.write_bytes(data)
+            path.chmod(0o755)
+            subprocess.run(
+                [strip_tool, "--strip-debug", str(path)], check=True
+            )
+            data = path.read_bytes()
+            stripped.append(name)
+        dst.writestr(item, data)
+        if not name.endswith("/"):
+            digest = urlsafe_b64encode(sha256(data).digest()).rstrip(b"=").decode()
+            records.append((name, f"sha256={digest}", str(len(data))))
+    rows = StringIO(newline="")
+    writer = csv.writer(rows, lineterminator="\n")
+    writer.writerows(records)
+    writer.writerow((record_name, "", ""))
+    dst.writestr(record_name, rows.getvalue().encode())
+print(f"Removed debug sections from {len(stripped)} vLLM ELF files.")
+PY
 SLIM_AITER_WHEEL="$STAGE/wheels/$(basename "$AITER_WHEEL")"
 "$BUILD_PYTHON" - "$AITER_WHEEL" "$SLIM_AITER_WHEEL" <<'PY'
 from base64 import urlsafe_b64encode
@@ -181,6 +235,9 @@ with ZipFile(source) as src, ZipFile(
     dst.writestr(record_name, rows.getvalue().encode())
 PY
 cp -a "$AITER_SITE/aiter/jit/"*.so "$STAGE/runtime/aiter/jit/"
+for module in "$STAGE/runtime/aiter/jit/"*.so; do
+    "$STRIP_TOOL" --strip-debug "$module"
+done
 cp -a "$AITER_SITE/aiter/ops/triton/configs/gfx90a" \
     "$STAGE/runtime/aiter/ops/triton/configs/"
 cp -a "$RANKING" "$STAGE/rankings/expert-ranking.json"
@@ -290,7 +347,7 @@ Source commit: \`$COMMIT\`
 
 Included files:
 
-- \`wheels/$VLLM_FILE\`: vLLM wheel compiled for gfx90a.
+- \`wheels/$VLLM_FILE\`: vLLM wheel compiled for gfx90a. ELF debug sections are removed.
 - \`wheels/$AITER_FILE\`: reduced AITER runtime. It keeps the import source and templates that AITER reads. It excludes bundled code objects, third-party build trees, heuristic models, and non-gfx90a data.
 - \`runtime/aiter\`: tested gfx90a AITER modules and configuration files.
 - \`rankings/expert-ranking.json\`: tested static expert order.
@@ -325,6 +382,7 @@ Kit: $KIT_NAME
 Runtime source commit: $COMMIT
 Kit builder commit: $BUILDER_COMMIT
 Build target: Ubuntu 24.04, Linux x86-64, Python 3.12, ROCm 7.2.1, gfx90a
+Build type: Release; packaged ELF debug sections removed
 vLLM wheel: wheels/$VLLM_FILE
 AITER wheel: wheels/$AITER_FILE
 AITER wheel: bundled code objects, third-party build trees, heuristics, and unused aiter_meta removed
