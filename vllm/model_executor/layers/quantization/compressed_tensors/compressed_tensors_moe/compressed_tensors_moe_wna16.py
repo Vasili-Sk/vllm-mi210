@@ -55,6 +55,27 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+def _append_rocm_w2_guard_expert(
+    w2_qweight: torch.Tensor,
+    w2_scales: torch.Tensor,
+    w2_qzeros: torch.Tensor | None,
+    backend: WNA16MoEBackend,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Append an inaccessible guard expert for the ROCm Triton W2 kernel."""
+    if (
+        not current_platform.is_rocm()
+        or backend != WNA16MoEBackend.TRITON
+        or w2_qweight.shape[0] != 512
+    ):
+        return w2_qweight, w2_scales, w2_qzeros
+
+    w2_qweight = torch.cat((w2_qweight, torch.zeros_like(w2_qweight[:1])), dim=0)
+    w2_scales = torch.cat((w2_scales, torch.zeros_like(w2_scales[:1])), dim=0)
+    if w2_qzeros is not None:
+        w2_qzeros = torch.cat((w2_qzeros, torch.zeros_like(w2_qzeros[:1])), dim=0)
+    return w2_qweight, w2_scales, w2_qzeros
+
+
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     def __init__(
         self,
@@ -543,6 +564,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             _,  # w2_bias
         ) = converted
 
+        # The ROCm Triton W2 kernel can read one expert past the last physical
+        # row when expert 511 is selected. The logical expert count stays 512.
+        w2_qweight, w2_scales, w2_qzeros = _append_rocm_w2_guard_expert(
+            w2_qweight, w2_scales, w2_qzeros, self.wna16_backend
+        )
+
         # Replace common parameters
         replace_parameter(layer, "w13_weight_packed", w13_qweight)
         replace_parameter(layer, "w2_weight_packed", w2_qweight)
@@ -614,6 +641,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             self.wna16_backend == WNA16MoEBackend.TRITON
             and self.num_bits == 4
             and current_platform.is_rocm()
+            # The gfx9 N-packed kernel is correct for group-128 weights only.
+            and self.group_size == 128
         ):
             from vllm.platforms.rocm import on_gfx1x, on_gfx9
 

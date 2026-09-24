@@ -22,6 +22,9 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
 from vllm.model_executor.layers.quantization import moe_wna16
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+    compressed_tensors_moe_wna16 as ct_wna16,
+)
 from vllm.model_executor.layers.quantization.moe_wna16 import (
     MoeWNA16Config,
     MoeWNA16Method,
@@ -139,6 +142,29 @@ def test_compressed_tensors_weights_are_transposed_for_triton():
     assert torch.equal(converted[1], w2.transpose(1, 2).contiguous().view(torch.uint8))
     assert torch.equal(converted[2], w13_scale.transpose(1, 2).contiguous())
     assert torch.equal(converted[3], w2_scale.transpose(1, 2).contiguous())
+
+
+def test_rocm_triton_wna16_adds_zero_w2_guard_expert(monkeypatch) -> None:
+    monkeypatch.setattr(ct_wna16.current_platform, "is_rocm", lambda: True)
+    qweight = torch.ones((512, 2, 4), dtype=torch.uint8)
+    scales = torch.ones((512, 2, 1), dtype=torch.float16)
+    qzeros = torch.ones((512, 2, 1), dtype=torch.uint8)
+
+    guarded_weight, guarded_scales, guarded_zeros = (
+        ct_wna16._append_rocm_w2_guard_expert(
+            qweight, scales, qzeros, WNA16MoEBackend.TRITON
+        )
+    )
+
+    assert guarded_weight.shape[0] == 513
+    assert guarded_scales.shape[0] == 513
+    assert guarded_zeros is not None and guarded_zeros.shape[0] == 513
+    assert torch.equal(guarded_weight[:512], qweight)
+    assert torch.equal(guarded_scales[:512], scales)
+    assert torch.equal(guarded_zeros[:512], qzeros)
+    assert torch.count_nonzero(guarded_weight[-1]) == 0
+    assert torch.count_nonzero(guarded_scales[-1]) == 0
+    assert torch.count_nonzero(guarded_zeros[-1]) == 0
 
 
 def test_moe_wna16_setup_forwards_selected_backend(monkeypatch):
