@@ -49,7 +49,14 @@ elif current_platform.is_rocm():
                 flash_attn_varlen_func,
             )
         else:
-            from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
+            try:
+                from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
+            except ImportError:
+                # Most ROCm targets do not provide upstream flash-attn. AITER's
+                # Triton MHA uses the same variable-length interface.
+                from aiter.ops.triton.mha import (  # type: ignore[no-redef]
+                    flash_attn_varlen_func,
+                )
 
         _ROCM_FLASH_ATTN_AVAILABLE = True
     except ImportError:
