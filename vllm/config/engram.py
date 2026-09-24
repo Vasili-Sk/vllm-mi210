@@ -50,13 +50,13 @@ class EngramConfig:
         if (
             model_config is None
             or model_config.architecture not in supported_architectures
-            or not current_platform.is_cuda()
+            or not current_platform.is_cuda_alike()
             or not getattr(model_config.hf_text_config, "ple_layer_ids", None)
         ):
             raise ValueError(
                 "EngramConfig requires a model with supported Engram "
-                "embeddings. Currently only the CUDA Qwen4Exp implementation "
-                "with non-empty ple_layer_ids is supported."
+                "embeddings, non-empty n-gram layer ids, and a CUDA-alike "
+                "device (CUDA or ROCm)."
             )
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:

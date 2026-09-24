@@ -951,21 +951,28 @@ def test_engram_cpu_offload_environment_fallback(monkeypatch, legacy):
 
 
 @pytest.mark.parametrize(
-    "architecture, ple_layers, cuda, supported",
+    "architecture, ple_layers, platform, supported",
     [
-        ("Qwen4ExpForCausalLM", [1], True, True),
-        ("Qwen4ExpForConditionalGeneration", [1], True, True),
-        ("Qwen4ExpForCausalLM", [], True, False),
-        ("Qwen4ExpForCausalLM", None, True, False),
-        ("Qwen4ExpForCausalLM", [1], False, False),
-        ("LlamaForCausalLM", [1], True, False),
-        ("Qwen4ExpMTP", [], True, False),
-        (None, None, True, False),
+        ("Qwen4ExpForCausalLM", [1], "cuda", True),
+        ("Qwen4ExpForCausalLM", [1], "rocm", True),
+        ("Qwen4ExpForConditionalGeneration", [1], "cuda", True),
+        ("Qwen4ExpForConditionalGeneration", [1], "rocm", True),
+        ("Qwen4ExpForCausalLM", [], "cuda", False),
+        ("Qwen4ExpForCausalLM", None, "cuda", False),
+        ("Qwen4ExpForCausalLM", [1], "cpu", False),
+        ("LlamaForCausalLM", [1], "cuda", False),
+        ("Qwen4ExpMTP", [], "cuda", False),
+        (None, None, "cuda", False),
     ],
 )
-def test_engram_model_support(monkeypatch, architecture, ple_layers, cuda, supported):
+def test_engram_model_support(
+    monkeypatch, architecture, ple_layers, platform, supported
+):
     """A similarly named HF field must not enable unsupported implementations."""
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: cuda)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: platform == "cuda")
+    monkeypatch.setattr(
+        current_platform, "is_cuda_alike", lambda: platform in ("cuda", "rocm")
+    )
     model = (
         cast(
             ModelConfig,
