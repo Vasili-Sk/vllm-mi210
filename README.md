@@ -1,110 +1,225 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vLLM MI210 Flash-Next
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+This repository is an experimental vLLM fork for Qwen Flash-Next on AMD Instinct MI210.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+The `flash-next-offloaded` branch adds disk-backed PLE, ROCm QSA fixes, AITER attention fallback, WNA16 safety fixes, and static expert residency.
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+## Recommended MI210 settings
 
----
+| Setting | Recommended value | Purpose |
+|---|---:|---|
+| `ROCM_PATH` | `/opt/rocm` | Select the ROCm installation. |
+| `VLLM_TARGET_DEVICE` | `rocm` | Build and run the ROCm backend. |
+| `VLLM_ROCM_USE_AITER` | `1` | Enable supported AITER ROCm kernels. |
+| `VLLM_ROCM_USE_AITER_MHA` | `0` | Do not replace head-dimension-256 full attention. |
+| `PYTORCH_CUDA_ALLOC_CONF` | `max_split_size_mb:128` | Reduce large inactive allocator blocks. |
+| `GPU_PINNED_MIN_XFER_SIZE` | `67108864` | Use pinned transfers for large host copies. |
+| `HSA_NO_SCRATCH_RECLAIM` | `1` | Keep ROCm scratch memory stable. |
+| `HIP_FORCE_DEV_KERNARG` | `1` | Use the tested HIP kernel-argument path. |
+| `VLLM_PLE_MMAP` | `1` | Keep the large PLE table in model files. |
+| `VLLM_QSA_SORT_BLOCKS` | `1` | Keep multirow QSA block order stable. |
+| `VLLM_WNA16_HOT_TIER_SIZE` | `424` | Keep 424 of 512 experts per layer in VRAM. |
+| `VLLM_WNA16_HOT_TIER_FILE` | Ranking JSON path | Select the expert order for each layer. |
+| `VLLM_WNA16_HOT_TIER_COMPACT_UVA` | `0` | Reuse full UVA tensors when host RAM permits. |
+| `--tensor-parallel-size` | `1` | Use one MI210. |
+| `--kv-cache-dtype` | `bfloat16` | Use the tested KV-cache format. |
+| `--max-model-len` | `8256` | Support an 8,192-token prompt plus output. |
+| `--max-num-batched-tokens` | `4096` | Split 8K prefill into two chunks. |
+| `--max-num-seqs` | `1` | Limit graph and KV memory use. |
+| `--gpu-memory-utilization` | `0.99` | Reserve most MI210 memory for vLLM. |
+| `--safetensors-load-strategy` | `lazy` | Load local safetensors when needed. |
+| `--offload-backend` | `uva` | Let the GPU address pinned host tensors. |
+| `--cpu-offload-gb` | `10` | Set the expert offload budget. |
+| `--cpu-offload-params` | `experts` | Offload expert tensors only. |
+| `--compilation-config` | `FULL_DECODE_ONLY` | Capture full decode graphs. |
+| Prefix caching | Disabled | Make validation run the full prefill path. |
 
-## About
+## Start script
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+Save this file as `serve-flash-next-mi210.sh`.
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
-
-vLLM is fast with:
-
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
-
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+Set `MODEL` and `RANKINGS` before you run it.
 
 ```bash
-uv pip install vllm
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${MODEL:?Set MODEL to the local Flash-Next model directory}"
+: "${RANKINGS:?Set RANKINGS to the expert-ranking JSON file}"
+
+export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+export VLLM_TARGET_DEVICE=rocm
+
+export VLLM_ROCM_USE_AITER=1
+export VLLM_ROCM_USE_AITER_MHA=0
+
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export GPU_PINNED_MIN_XFER_SIZE=67108864
+export HSA_NO_SCRATCH_RECLAIM=1
+export HIP_FORCE_DEV_KERNARG=1
+
+export VLLM_PLE_MMAP=1
+unset VLLM_PLE_CPU_OFFLOAD
+
+export VLLM_QSA_SORT_BLOCKS=1
+
+export VLLM_WNA16_HOT_TIER_SIZE=424
+export VLLM_WNA16_HOT_TIER_FILE="$RANKINGS"
+export VLLM_WNA16_HOT_TIER_COMPACT_UVA=0
+
+template_args=()
+if [[ -f "$MODEL/chat_template.jinja" ]]; then
+    template_args=(--chat-template "$MODEL/chat_template.jinja")
+fi
+
+exec vllm serve "$MODEL" \
+    --host "${HOST:-0.0.0.0}" \
+    --port "${PORT:-8000}" \
+    --served-model-name "${SERVED_MODEL_NAME:-qwen-flash-next}" \
+    --tensor-parallel-size 1 \
+    --kv-cache-dtype bfloat16 \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --max-model-len 8256 \
+    --max-num-batched-tokens 4096 \
+    --max-num-seqs 1 \
+    --gpu-memory-utilization 0.99 \
+    --safetensors-load-strategy lazy \
+    --offload-backend uva \
+    --cpu-offload-gb 10 \
+    --cpu-offload-params experts \
+    --no-enable-prefix-caching \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    "${template_args[@]}"
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+Run it with:
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+```bash
+MODEL=/path/to/model \
+RANKINGS=/path/to/expert-rankings.json \
+./serve-flash-next-mi210.sh
+```
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+The script does not select a GPU. Set your normal ROCm device variables outside the script when the system has more than one GPU.
 
-## Contributing
+## What this fork adds
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+### Disk-backed PLE
 
-## Citation
+`VLLM_PLE_MMAP=1` keeps the PLE table in read-only safetensors mappings.
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
+The runtime gathers the required rows into fixed host and GPU staging buffers.
 
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
+The old `VLLM_PLE_CPU_OFFLOAD=1` mode keeps the full PLE table in pinned host memory. It remains available for compatibility.
+
+### ROCm QSA
+
+The ROCm QSA path uses AITER Triton attention when ROCm `flash-attn` is not available.
+
+`VLLM_QSA_SORT_BLOCKS=1` sorts multirow QSA selections. This fixes unstable prefill ordering.
+
+The sparse-attention split-K path also keeps one reduction layout through eight rows.
+
+### WNA16 safety
+
+The ROCm Triton WNA16 path adds a zero W2 guard row for 512-expert layers.
+
+The logical expert count stays 512.
+
+The gfx9 packed layout is limited to validated group-128 weights.
+
+### Static expert residency
+
+The hot tier keeps ranked experts in MI210 memory.
+
+Cold experts stay in pinned host memory.
+
+The Triton kernel runs every selected expert. It does not drop cold routes.
+
+The ranking file must contain one complete expert permutation for each managed layer.
+
+Example format:
+
+```json
+{
+  "0": [0, 1, 2, 3],
+  "1": [3, 1, 0, 2]
 }
 ```
 
-## Contact Us
+A 512-expert model needs every ID from `0` through `511` exactly once in each layer entry.
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+### Immutable expert refill
 
-## Media Kit
+The repository contains a safetensors refill helper.
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+It can rebuild one GPTQ expert in the Triton runtime layout.
+
+Adaptive expert migration is not connected yet.
+
+## Model requirements
+
+The current runtime expects:
+
+- A local Qwen Flash-Next checkpoint.
+- A local `model.safetensors.index.json`.
+- All referenced safetensors shards.
+- W4A16 routed experts.
+- Symmetric WNA16 weights for the hot tier.
+- FP8 or supported PLE tensors.
+- A complete expert-ranking JSON file.
+- A compatible external AITER installation.
+
+## Tested configuration
+
+The current end-to-end test used:
+
+- One AMD Instinct MI210.
+- ROCm 7.2.
+- 48 managed MoE layers.
+- 512 experts per layer.
+- 424 resident experts per layer.
+- 88 host-backed experts per layer.
+- Disk-backed PLE.
+- Full decode graphs.
+- An 8,256-token model limit.
+- A 4,096-token prefill chunk size.
+
+The server completed model loading, graph capture, health checks, and text generation.
+
+## Branches
+
+| Branch | Purpose |
+|---|---|
+| `main` | Clean vLLM upstream line. |
+| `vendor/davetha-mi210.7` | Imported davetha MI210 base. |
+| `mi210/main` | MI210 base branch. |
+| `flash-next-offloaded` | Flash-Next offload development branch. |
+
+## Important source work
+
+- [vLLM PR #54371](https://github.com/vllm-project/vllm/pull/54371): UVA PLE offload and Engram sharding.
+- [vLLM PR #57497](https://github.com/vllm-project/vllm/pull/57497): ROCm PLE host offload.
+- [vLLM PR #54129](https://github.com/vllm-project/vllm/pull/54129): mmap-backed PLE design.
+
+PR #54129 was adapted to the shared PLE code and the AMD model path.
+
+## Known limits
+
+- This is not an official vLLM release.
+- The tested target is one MI210.
+- Multi-GPU Flash-Next offload is not validated.
+- Adaptive expert migration is not connected.
+- MTP is not part of the current public runtime path.
+- AITER is external and must be installed separately.
+- Memory values must be retested for other models and GPUs.
+
+## Upstream
+
+This fork is based on [vLLM](https://github.com/vllm-project/vllm).
+
+Use the [official vLLM documentation](https://docs.vllm.ai) for general installation and API information.
+
+The repository keeps the upstream vLLM license and source notices.
