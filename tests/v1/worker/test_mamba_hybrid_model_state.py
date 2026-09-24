@@ -18,6 +18,25 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 
 
+def test_prepare_runtime_dummy_inputs_uses_default_input_path() -> None:
+    state = object.__new__(MambaHybridModelState)
+    input_batch = object()
+    req_states = object()
+    expected = {"input_ids": "sentinel"}
+    calls = []
+
+    def prepare_inputs(batch: object, states: object) -> dict:
+        calls.append((batch, states))
+        return expected
+
+    state.prepare_inputs = prepare_inputs
+
+    result = state.prepare_runtime_dummy_inputs(input_batch, req_states)
+
+    assert result is expected
+    assert calls == [(input_batch, req_states)]
+
+
 def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
     state = object.__new__(MambaHybridModelState)
     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)

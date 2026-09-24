@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_MMAP: bool = False
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -2081,6 +2082,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy fallback for EngramConfig.cpu_offload, which takes precedence.
     # This environment variable may be removed in a future release.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
+    # Keep Qwen4Exp PLE embedding tables in read-only file mappings.
+    "VLLM_PLE_MMAP": lambda: bool(int(os.getenv("VLLM_PLE_MMAP", "0"))),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))

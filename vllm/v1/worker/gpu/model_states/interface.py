@@ -211,6 +211,19 @@ class ModelState(ABC):
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         raise NotImplementedError
 
+    def prepare_runtime_dummy_inputs(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> dict[str, Any]:
+        """Prepare inputs for a runtime dummy batch.
+
+        This path uses an existing ``InputBatch`` and ``RequestState`` pair.
+        The default behavior matches a real input preparation. A model state
+        can override this method when dummy runs must not read real state.
+        """
+        return self.prepare_inputs(input_batch, req_states)
+
     @abstractmethod
     def prepare_attn(
         self,

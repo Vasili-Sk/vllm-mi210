@@ -2,13 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
+import json
 import math
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -39,6 +43,69 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
 )
+from ..common.ple_mmap import PleMmapTable, Qwen4ExpPLEMmapEmbedding
+
+
+def _ple_mmap_enabled() -> bool:
+    """VLLM_PLE_MMAP=1 keeps the n-gram table on disk instead of in memory.
+
+    Neither VRAM nor pinned host RAM is used. Rows are gathered from a read-only
+    mmap, so the pages stay clean, file backed and reclaimable. This mirrors
+    llama.cpp's TENSOR_READ_LAZY. Read at construction time, not import time.
+    """
+    return envs.VLLM_PLE_MMAP
+
+
+def _ple_model_dir() -> str:
+    model_config = get_current_vllm_config().model_config
+    for attr in ("model_dir", "model_path", "model"):
+        value = getattr(model_config, attr, None)
+        if isinstance(value, str) and value and os.path.isdir(value):
+            return value
+    raise RuntimeError(
+        "VLLM_PLE_MMAP needs a local checkpoint directory to map shards from, "
+        f"but model_config exposed none (tried model_dir, model_path, model)."
+    )
+
+
+def _build_ple_mmap_table(
+    split_ngram_parts: int,
+    rows_per_shard: int,
+    embedding_dim: int,
+    row_bytes: int,
+    num_rows: int,
+) -> PleMmapTable:
+    """Locate every n-gram shard through model.safetensors.index.json."""
+    model_dir = _ple_model_dir()
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        raise RuntimeError(f"VLLM_PLE_MMAP: missing index file {index_path}")
+    with open(index_path) as handle:
+        weight_map = json.load(handle)["weight_map"]
+    shards: dict[int, tuple[str, str]] = {}
+    for tensor_name, file_name in weight_map.items():
+        marker = ".ngram_embedding.shard_"
+        if marker not in tensor_name or not tensor_name.endswith(".weight"):
+            continue
+        shard_text = tensor_name.rsplit(marker, 1)[1][: -len(".weight")]
+        if not shard_text.isdigit():
+            continue
+        shard_index = int(shard_text)
+        if shard_index < split_ngram_parts:
+            shards[shard_index] = (os.path.join(model_dir, file_name), tensor_name)
+    if len(shards) != split_ngram_parts:
+        raise RuntimeError(
+            f"VLLM_PLE_MMAP: expected {split_ngram_parts} n-gram shards in "
+            f"{index_path}, discovered {len(shards)}"
+        )
+    return PleMmapTable(
+        model_dir,
+        shards,
+        rows_per_shard,
+        embedding_dim,
+        row_bytes,
+        num_rows,
+    )
 
 logger = init_logger(__name__)
 
@@ -247,11 +314,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             getattr(config, "ple_embedding_dtype", None),
         )
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        if _ple_mmap_enabled():
+            embedding_cls = Qwen4ExpPLEMmapEmbedding
+        elif engram_config is not None and engram_config.cpu_offload:
+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
+        else:
+            embedding_cls = Qwen4ExpPLEDeviceEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
@@ -286,6 +354,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ),
             persistent=False,
         )
+        # Stable device storage filled by ModelState before compiled execution.
+        # The mmap table and host synchronization never enter the FX graph.
+        self._mmap_staging: torch.Tensor | None = None
 
     @staticmethod
     def _shift_precompute(
@@ -322,12 +393,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute table row ids on the GPU outside model execution."""
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
         num_reqs = query_start_loc.numel() - 1
@@ -385,7 +457,61 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
-        ngram_ids = torch.cat(id_blocks, dim=-1)
+        return torch.cat(id_blocks, dim=-1)
+
+    def initialize_mmap_staging(
+        self, max_num_tokens: int, device: torch.device
+    ) -> None:
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, Qwen4ExpPLEMmapEmbedding):
+            return
+        self._mmap_staging = torch.zeros(
+            (max_num_tokens, self.ngram_heads, self.head_dim),
+            dtype=embedding.weight.dtype,
+            device=device,
+        )
+
+    def prepare_mmap_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        actual_tokens: int,
+        padded_tokens: int,
+    ) -> None:
+        if self._mmap_staging is None:
+            raise RuntimeError("PLE mmap staging was not initialized")
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, Qwen4ExpPLEMmapEmbedding):
+            raise RuntimeError("PLE mmap staging used with a non-mmap embedding")
+        if actual_tokens:
+            ids = self.compute_ngram_ids(
+                input_ids[:actual_tokens], query_start_loc, ngram_context
+            )
+            embedding.gather_into(ids, self._mmap_staging[:actual_tokens])
+        if padded_tokens > actual_tokens:
+            self._mmap_staging[actual_tokens:padded_tokens].zero_()
+
+    def prepare_dummy_mmap_rows(self, padded_tokens: int) -> None:
+        if self._mmap_staging is None:
+            raise RuntimeError("PLE mmap staging was not initialized")
+        self._mmap_staging[:padded_tokens].zero_()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(self.ngram_embedding, Qwen4ExpPLEMmapEmbedding):
+            if self._mmap_staging is None:
+                raise RuntimeError("PLE mmap requires Model Runner V2 staging")
+            num_tokens = input_ids.reshape(-1).shape[0]
+            return self._mmap_staging[:num_tokens].flatten(-2)
+
+        ngram_ids = self.compute_ngram_ids(
+            input_ids, query_start_loc, ngram_context
+        )
         embedding = self.ngram_embedding
         if embedding.supports_prefetch:
             output = ngram_ids.new_empty(
@@ -393,9 +519,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 dtype=embedding.weight.dtype,
             )
             torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_pinned(
-                ngram_ids,
-                output,
-                self.layer_name,
+                ngram_ids, output, self.layer_name
             )
             return output
         output = ngram_ids.new_empty(
@@ -403,9 +527,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             dtype=embedding.params_dtype,
         )
         torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
-            ngram_ids,
-            output,
-            self.layer_name,
+            ngram_ids, output, self.layer_name
         )
         return output
 
@@ -462,6 +584,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
+                if isinstance(embedding, Qwen4ExpPLEMmapEmbedding):
+                    # Disk-backed table: validate the shard, then drop it. The
+                    # rows are gathered from mmap at lookup time, so no copy is
+                    # made and no RAM is committed to the table.
+                    if embedding.mmap_table is None:
+                        embedding.attach_mmap_table(
+                            _build_ple_mmap_table(
+                                self.split_ngram_parts,
+                                shard_size,
+                                embedding.embedding_dim,
+                                embedding.embedding_dim
+                                * loaded_weight.element_size(),
+                                embedding.org_vocab_size,
+                            )
+                        )
+                    del loaded_weight
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 embedding.weight.weight_loader(
                     embedding.weight,
                     loaded_weight,
@@ -473,6 +613,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        ngram_embedding = getattr(self, "ngram_embedding", None)
+        if isinstance(ngram_embedding, Qwen4ExpPLEMmapEmbedding):
+            table = ngram_embedding.mmap_table
+            if table is not None:
+                # Bulk loading may have filled the page cache with table bytes.
+                # Drop them; lookups re-read only the rows a request touches.
+                table.advise_dontneed()
         return loaded
 
 
@@ -855,7 +1002,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         # The last request row is the dummy sink for graph padding.
         packed = x_spec.new_zeros((num_reqs + 1, max_len, hidden_size))
-        packed[pack_req_indices, pack_col_indices] = x_spec
+        flat_indices = pack_req_indices.clamp(0, num_reqs) * max_len
+        flat_indices = flat_indices + pack_col_indices.clamp(0, max_len - 1)
+        packed.view(-1, hidden_size).index_copy_(0, flat_indices, x_spec)
         packed = packed.transpose(1, 2).contiguous()
 
         if self.conv_state_len > 0:
@@ -1143,6 +1292,7 @@ def qwen4_exp_amd_ple_ngram_embedding(
     output.copy_(result)
 
 
+@eager_break_during_capture
 def qwen4_exp_amd_ple_ngram_embedding_pinned(
     ngram_ids: torch.Tensor,
     output: torch.Tensor,

@@ -1767,9 +1767,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "positions": input_batch.positions,
             "inputs_embeds": inputs_embeds,
             "intermediate_tensors": None,
-            # NOTE: Values returned by `prepare_inputs` will override the default
-            # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            # NOTE: Prepared values override the defaults above. Dummy runs use
+            # a separate path so model-specific state can avoid real data reads.
+            **(
+                self.model_state.prepare_runtime_dummy_inputs(
+                    input_batch, self.req_states
+                )
+                if dummy_run
+                else self.model_state.prepare_inputs(input_batch, self.req_states)
+            ),
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.

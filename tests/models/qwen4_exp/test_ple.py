@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +13,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+import vllm.envs as envs
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.common.ngram_embedding as ngram_embedding_module
@@ -28,6 +31,7 @@ from vllm.models.qwen4_exp.common.ple import (
     compute_ple_shard_overlap,
     copy_ple_embedding_shard_,
 )
+from vllm.models.qwen4_exp.common.ple_mmap import PleMmapTable
 from vllm.models.qwen4_exp.config import Qwen4ExpTextConfig
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpNGramEmbedding,
@@ -1870,6 +1874,67 @@ def test_amd_pinned_embedding_output_written_under_compile(
 
     expected = loaded_weight[ngram_ids.cpu()].to(device="cuda:0").flatten(-2)
     torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=0)
+
+
+def test_amd_mmap_flag_is_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_PLE_MMAP", raising=False)
+    assert not amd_ple_layer._ple_mmap_enabled()
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    assert amd_ple_layer._ple_mmap_enabled()
+    assert "VLLM_PLE_MMAP" in envs.compile_factors()
+
+
+def _write_mmap_test_shard(
+    path: Path,
+    tensor_name: str,
+    rows: list[list[int]],
+) -> None:
+    data = bytes(value for row in rows for value in row)
+    header = json.dumps(
+        {
+            tensor_name: {
+                "dtype": "F8_E4M3",
+                "shape": [len(rows), len(rows[0])],
+                "data_offsets": [0, len(data)],
+            }
+        }
+    ).encode()
+    path.write_bytes(len(header).to_bytes(8, "little") + header + data)
+
+
+def test_amd_mmap_gather_preserves_rows_and_zero_fills(tmp_path: Path) -> None:
+    """The mmap table must preserve shard boundaries and invalid-row zeros."""
+    names = [
+        "model.layers.0.ple.ngram_embedding.shard_0.weight",
+        "model.layers.0.ple.ngram_embedding.shard_1.weight",
+    ]
+    paths = [tmp_path / "part-0.safetensors", tmp_path / "part-1.safetensors"]
+    rows = [
+        [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]],
+        [[20, 21, 22, 23], [24, 25, 26, 27]],
+    ]
+    for path, name, shard_rows in zip(paths, names, rows):
+        _write_mmap_test_shard(path, name, shard_rows)
+
+    table = PleMmapTable(
+        str(tmp_path),
+        {index: (str(paths[index]), names[index]) for index in range(2)},
+        rows_per_shard=3,
+        embedding_dim=4,
+        row_bytes=4,
+        num_rows=5,
+    )
+    ids = torch.tensor([[0, 2], [3, 4], [-1, 5]])
+    gathered = table.gather(ids).view(torch.uint8)
+    expected = torch.tensor(
+        [
+            [[0, 1, 2, 3], [8, 9, 10, 11]],
+            [[20, 21, 22, 23], [24, 25, 26, 27]],
+            [[0, 0, 0, 0], [0, 0, 0, 0]],
+        ],
+        dtype=torch.uint8,
+    )
+    torch.testing.assert_close(gathered, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")

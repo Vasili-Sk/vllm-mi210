@@ -13,6 +13,9 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
 
+from ..common.ple_mmap import Qwen4ExpPLEMmapEmbedding
+from .ple_layer import Qwen4ExpNGramEmbedding
+
 
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
@@ -27,6 +30,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        self._mmap_ple_modules: tuple[Qwen4ExpNGramEmbedding, ...] = ()
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -61,6 +65,33 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        self._mmap_ple_modules = tuple(
+            module
+            for module in model.modules()
+            if isinstance(module, Qwen4ExpNGramEmbedding)
+            and isinstance(module.ngram_embedding, Qwen4ExpPLEMmapEmbedding)
+        )
+        for module in self._mmap_ple_modules:
+            module.initialize_mmap_staging(self.max_num_tokens, self.device)
+
+    def _dummy_query_start_loc_and_context(
+        self, num_reqs: int, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query_start_loc = self.ple_query_start_loc[: num_reqs + 1]
+        query_start_loc[0] = 0
+        tokens_per_req, num_extra_tokens = divmod(num_tokens, num_reqs)
+        query_lens = torch.full(
+            (num_reqs,),
+            tokens_per_req,
+            dtype=query_start_loc.dtype,
+            device=query_start_loc.device,
+        )
+        if num_extra_tokens > 0:
+            query_lens[-num_extra_tokens:] += 1
+        torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
+        ngram_context = self.ngram_context[:num_reqs]
+        ngram_context.fill_(self.ngram_eos_token_id)
+        return query_start_loc, ngram_context
 
     def _prepare_ngram_context(
         self,
@@ -103,10 +134,23 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+        if self._mmap_ple_modules:
+            actual_tokens = input_batch.num_tokens
+            padded_tokens = input_batch.num_tokens_after_padding
+            num_reqs = input_batch.num_reqs
+            for module in self._mmap_ple_modules:
+                module.prepare_mmap_rows(
+                    input_batch.input_ids[:actual_tokens],
+                    query_start_loc[: num_reqs + 1],
+                    ngram_context[:num_reqs],
+                    actual_tokens,
+                    padded_tokens,
+                )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -118,25 +162,38 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if not self.uses_ngram_embedding:
             return model_inputs
 
-        query_start_loc = self.ple_query_start_loc[: num_reqs + 1]
-        query_start_loc[0] = 0
-        tokens_per_req, num_extra_tokens = divmod(num_tokens, num_reqs)
-        query_lens = torch.full(
-            (num_reqs,),
-            tokens_per_req,
-            dtype=query_start_loc.dtype,
-            device=query_start_loc.device,
+        query_start_loc, ngram_context = self._dummy_query_start_loc_and_context(
+            num_reqs, num_tokens
         )
-        if num_extra_tokens > 0:
-            query_lens[-num_extra_tokens:] += 1
-        torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
-
-        ngram_context = self.ngram_context[:num_reqs]
-        ngram_context.fill_(self.ngram_eos_token_id)
         model_inputs.update(
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        for module in self._mmap_ple_modules:
+            module.prepare_dummy_mmap_rows(num_tokens)
+        return model_inputs
+
+    def prepare_runtime_dummy_inputs(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> dict[str, Any]:
+        # Runtime profile batches have no real request history. Skip mmap table
+        # reads and stage deterministic zeros at their padded shapes.
+        model_inputs = super().prepare_inputs(input_batch, req_states)
+        if not self.uses_ngram_embedding:
+            return model_inputs
+        num_reqs = input_batch.num_reqs_after_padding
+        num_tokens = input_batch.num_tokens_after_padding
+        query_start_loc, ngram_context = self._dummy_query_start_loc_and_context(
+            num_reqs, num_tokens
+        )
+        model_inputs.update(
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+        )
+        for module in self._mmap_ple_modules:
+            module.prepare_dummy_mmap_rows(num_tokens)
         return model_inputs
 
 
