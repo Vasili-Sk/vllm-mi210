@@ -830,16 +830,11 @@ class QSAKeyStateCache(_QSAStateCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Hold the open group's committed keys plus every row a speculative
-        # step stores before acceptance is known, rounded up to whole groups so
-        # the ring divides the attention block size (it joins the LCM that sets
-        # the scheduler block size). Anything narrower lets a rejected draft row
-        # overwrite a committed key the next step needs to close the group.
+        # step stores before acceptance is known. Round up to whole groups.
+        # Return this independent circular-buffer requirement to the hybrid
+        # cache manager. The attention cache can use a different block size.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
-        assert self.cache_config.block_size % capacity == 0, (
-            f"QSA ring capacity {capacity} must divide the attention block "
-            f"size {self.cache_config.block_size}"
-        )
         return CircularBufferSpec(
             block_size=capacity,
             num_kv_heads=1,

@@ -9,6 +9,7 @@ import math
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -807,6 +808,11 @@ def qsa_select_paged_tokens(
                 logits.stride(1),
                 block_topk,
             )
+        if envs.VLLM_QSA_SORT_BLOCKS and rows > 2:
+            sentinel = torch.iinfo(torch.int32).max
+            keys = torch.where(blocks >= 0, blocks, sentinel)
+            keys = torch.sort(keys, dim=-1).values
+            blocks.copy_(torch.where(keys == sentinel, -1, keys))
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
@@ -871,7 +877,9 @@ def qsa_sparse_paged_attention(
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
     # Narrow tiles favor decode; wide tiles improve throughput for prefill.
-    if base_programs <= small_profile_limit:
+    # Keep one split-K reduction tree for each speculative row count and its
+    # graph padding through eight rows. A different tree can change BF16 output.
+    if q.shape[0] <= 8 or base_programs <= small_profile_limit:
         block_n, target_splits, partial_warps = 16, 64, 4
     elif base_programs < 32:
         block_n, target_splits, partial_warps = 16, 32, 4

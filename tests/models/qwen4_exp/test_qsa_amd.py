@@ -120,21 +120,23 @@ def test_qsa_rmsnorm_uses_portable_implementation(default_vllm_config) -> None:
     torch.testing.assert_close(output, norm.forward_native(tensor))
 
 
-def test_qsa_selection_uses_portable_topk_on_rocm(
+def test_qsa_selection_uses_portable_topk_and_optional_sort_on_rocm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rows = 2
+    rows = 3
     token_topk = 8
     compress_ratio = 4
     block_topk = token_topk // compress_ratio
     blocks = torch.empty((rows, block_topk), dtype=torch.int32)
-    visible_blocks = torch.tensor([4, 6], dtype=torch.int32)
+    visible_blocks = torch.tensor([4, 6, 8], dtype=torch.int32)
     logits = torch.empty((rows, 8), dtype=torch.float32)
     selection_output = torch.empty(
         (rows, token_topk + compress_ratio - 1), dtype=torch.int32
     )
     topk_call: dict[str, Any] = {}
+    expanded_blocks: list[torch.Tensor] = []
 
+    monkeypatch.setenv("VLLM_QSA_SORT_BLOCKS", "1")
     monkeypatch.setattr(
         qsa_ops,
         "qsa_mqa_paged",
@@ -161,9 +163,10 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
             strides=(stride0, stride1),
             topk_tokens=topk_tokens,
         )
-        raw_topk_indices.zero_()
+        raw_topk_indices.copy_(torch.tensor([[1, 0], [0, 1], [1, 0]]))
 
     def expand_qsa_block_indices(*args) -> None:
+        expanded_blocks.append(args[0].clone())
         args[-1].fill_(-1)
 
     monkeypatch.setattr(qsa_ops.ops, "top_k_per_row_decode", top_k_per_row_decode)
@@ -194,6 +197,9 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
     assert topk_call["num_rows"] == rows
     assert topk_call["strides"] == (logits.stride(0), logits.stride(1))
     assert topk_call["topk_tokens"] == block_topk
+    torch.testing.assert_close(
+        expanded_blocks[0], torch.tensor([[0, 1]] * rows, dtype=torch.int32)
+    )
 
 
 @requires_qsa_kernels
@@ -201,6 +207,7 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
     ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
     [
         pytest.param(1, 24, 2, 1792, id="tp1_split64"),
+        pytest.param(8, 24, 2, 1792, id="tp1_graph_padding_split64"),
         pytest.param(16, 12, 1, 1792, id="tp2_split32"),
         pytest.param(32, 6, 1, 1024, id="tp4_split8"),
         pytest.param(257, 6, 1, 1024, id="tp4_split4"),

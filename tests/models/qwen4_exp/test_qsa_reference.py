@@ -393,15 +393,22 @@ def test_qsa_state_caches_adapt_the_unified_logical_layout() -> None:
 
 
 @pytest.mark.parametrize(
-    ("compress_ratio", "num_spec", "expected"),
-    [(4, 0, 4), (4, 1, 8), (4, 3, 8), (4, 4, 8), (4, 5, 12), (2, 3, 6)],
+    ("block_size", "compress_ratio", "num_spec", "expected"),
+    [
+        (48, 4, 0, 4),
+        (48, 4, 1, 8),
+        (48, 4, 3, 8),
+        (48, 4, 4, 8),
+        (32, 4, 5, 12),
+        (48, 2, 3, 6),
+    ],
 )
 def test_qsa_ring_capacity_covers_one_speculative_step(
-    compress_ratio: int, num_spec: int, expected: int
+    block_size: int, compress_ratio: int, num_spec: int, expected: int
 ) -> None:
     """Capacity spans the open group plus one speculative step, in whole groups."""
     spec = _qsa_key_cache(
-        block_size=48, compress_ratio=compress_ratio
+        block_size=block_size, compress_ratio=compress_ratio
     ).get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=num_spec))
     assert spec.block_size == expected
 
