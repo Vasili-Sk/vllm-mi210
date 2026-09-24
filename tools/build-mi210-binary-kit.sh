@@ -14,7 +14,8 @@ Usage:
     [--vllm-wheel /path/to/vllm-wheel.whl \
      --wheel-source-commit COMMIT] \
     [--output-dir ./bins] [--scratch-dir /path/outside/repository] \
-    [--rocm-path /opt/rocm-7.2.1] [--jobs 16]
+    [--rocm-path /opt/rocm-7.2.1] [--jobs 16] \
+    [--version 0.28.1rc0+mi210.flashnext]
 
 The AITER site-packages directory must contain aiter/jit/*.so and
 aiter/ops/triton/configs/gfx90a. The script copies only these tested runtime
@@ -43,6 +44,7 @@ OUTPUT_DIR="$REPO/bins"
 SCRATCH_DIR=
 ROCM_PATH=${ROCM_PATH:-/opt/rocm-7.2.1}
 JOBS=${MAX_JOBS:-16}
+PACKAGE_VERSION=${VLLM_VERSION_OVERRIDE:-0.28.1rc0+mi210.flashnext}
 
 while (($#)); do
     case "$1" in
@@ -57,6 +59,7 @@ while (($#)); do
         --scratch-dir) SCRATCH_DIR=$2; shift 2 ;;
         --rocm-path) ROCM_PATH=$2; shift 2 ;;
         --jobs) JOBS=$2; shift 2 ;;
+        --version) PACKAGE_VERSION=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -117,6 +120,7 @@ if [[ -z "$VLLM_WHEEL" ]]; then
         PYTORCH_ROCM_ARCH=gfx90a
         CMAKE_BUILD_TYPE=Release
         CARGO_PROFILE_RELEASE_STRIP=symbols
+        "VLLM_VERSION_OVERRIDE=$PACKAGE_VERSION"
         "MAX_JOBS=$JOBS"
         "TRITON_KERNELS_SRC_DIR=$TRITON_KERNELS_SRC_DIR"
         "$BUILD_PYTHON" -m pip wheel --no-build-isolation --no-deps
@@ -383,6 +387,7 @@ Runtime source commit: $COMMIT
 Kit builder commit: $BUILDER_COMMIT
 Build target: Ubuntu 24.04, Linux x86-64, Python 3.12, ROCm 7.2.1, gfx90a
 Build type: Release; packaged ELF debug sections removed
+Requested package version: $PACKAGE_VERSION
 vLLM wheel: wheels/$VLLM_FILE
 AITER wheel: wheels/$AITER_FILE
 AITER wheel: bundled code objects, third-party build trees, heuristics, and unused aiter_meta removed
