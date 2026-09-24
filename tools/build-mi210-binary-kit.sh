@@ -137,7 +137,49 @@ fi
 
 STAGE="$SCRATCH_DIR/stage/$KIT_NAME"
 mkdir -p "$STAGE"/{wheels,runtime/aiter/jit,runtime/aiter/ops/triton/configs,rankings,licenses}
-cp -a "$VLLM_WHEEL" "$AITER_WHEEL" "$STAGE/wheels/"
+cp -a "$VLLM_WHEEL" "$STAGE/wheels/"
+SLIM_AITER_WHEEL="$STAGE/wheels/$(basename "$AITER_WHEEL")"
+"$BUILD_PYTHON" - "$AITER_WHEEL" "$SLIM_AITER_WHEEL" <<'PY'
+from base64 import urlsafe_b64encode
+import csv
+from hashlib import sha256
+from io import StringIO
+from pathlib import Path
+import sys
+from zipfile import ZIP_DEFLATED, ZipFile
+
+source, output = map(Path, sys.argv[1:])
+records = []
+with ZipFile(source) as src, ZipFile(
+    output, "w", compression=ZIP_DEFLATED, compresslevel=6
+) as dst:
+    record_names = [
+        item.filename
+        for item in src.infolist()
+        if item.filename.endswith(".dist-info/RECORD")
+    ]
+    if len(record_names) != 1:
+        raise SystemExit("The AITER wheel must contain one RECORD file.")
+    record_name = record_names[0]
+    for item in src.infolist():
+        name = item.filename
+        required_meta = (
+            name.startswith("aiter_meta/csrc/")
+            and not name.endswith((".co", ".png", ".md", ".MD"))
+        )
+        if (name.startswith("aiter_meta/") and not required_meta) or name == record_name:
+            continue
+        data = src.read(name)
+        dst.writestr(item, data)
+        if not name.endswith("/"):
+            digest = urlsafe_b64encode(sha256(data).digest()).rstrip(b"=").decode()
+            records.append((name, f"sha256={digest}", str(len(data))))
+    rows = StringIO(newline="")
+    writer = csv.writer(rows, lineterminator="\n")
+    writer.writerows(records)
+    writer.writerow((record_name, "", ""))
+    dst.writestr(record_name, rows.getvalue().encode())
+PY
 cp -a "$AITER_SITE/aiter/jit/"*.so "$STAGE/runtime/aiter/jit/"
 cp -a "$AITER_SITE/aiter/ops/triton/configs/gfx90a" \
     "$STAGE/runtime/aiter/ops/triton/configs/"
@@ -249,7 +291,7 @@ Source commit: \`$COMMIT\`
 Included files:
 
 - \`wheels/$VLLM_FILE\`: vLLM wheel compiled for gfx90a.
-- \`wheels/$AITER_FILE\`: tested AITER Python runtime.
+- \`wheels/$AITER_FILE\`: reduced AITER runtime. It keeps the import source and templates that AITER reads. It excludes bundled code objects, third-party build trees, heuristic models, and non-gfx90a data.
 - \`runtime/aiter\`: tested gfx90a AITER modules and configuration files.
 - \`rankings/expert-ranking.json\`: tested static expert order.
 - \`install.sh\`: installer for an active Python 3.12 environment.
@@ -285,6 +327,7 @@ Kit builder commit: $BUILDER_COMMIT
 Build target: Ubuntu 24.04, Linux x86-64, Python 3.12, ROCm 7.2.1, gfx90a
 vLLM wheel: wheels/$VLLM_FILE
 AITER wheel: wheels/$AITER_FILE
+AITER wheel: bundled code objects, third-party build trees, heuristics, and unused aiter_meta removed
 AITER runtime: prebuilt top-level JIT modules and gfx90a Triton configurations
 Expert ranking: rankings/expert-ranking.json
 EOF
