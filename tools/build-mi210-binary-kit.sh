@@ -15,7 +15,7 @@ Usage:
      --wheel-source-commit COMMIT] \
     [--output-dir ./bins] [--scratch-dir /path/outside/repository] \
     [--rocm-path /opt/rocm-7.2.1] [--jobs 16] \
-    [--version 0.28.1rc0+mi210.flashnext]
+    [--version 0.28.1rc0+mi210.flashnext.rocm721]
 
 The AITER site-packages directory must contain aiter/jit/*.so and
 aiter/ops/triton/configs/gfx90a. The script copies only these tested runtime
@@ -44,7 +44,7 @@ OUTPUT_DIR="$REPO/bins"
 SCRATCH_DIR=
 ROCM_PATH=${ROCM_PATH:-/opt/rocm-7.2.1}
 JOBS=${MAX_JOBS:-16}
-PACKAGE_VERSION=${VLLM_VERSION_OVERRIDE:-0.28.1rc0+mi210.flashnext}
+PACKAGE_VERSION=${VLLM_VERSION_OVERRIDE:-0.28.1rc0+mi210.flashnext.rocm721}
 
 while (($#)); do
     case "$1" in
