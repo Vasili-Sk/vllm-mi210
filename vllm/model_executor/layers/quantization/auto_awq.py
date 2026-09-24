@@ -716,6 +716,10 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
         _replace_or_register_parameter(layer, "w2_bias", w2_bias)
 
         self._setup_kernel(layer)
+        from vllm.model_executor.layers.fused_moe.experts import hot_tier
+
+        if hot_tier.tier_size() > 0 and hot_tier.rankings_path():
+            hot_tier.build_and_attach(self, layer)
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:
         """Build the FusedMoEKernel for this layer."""

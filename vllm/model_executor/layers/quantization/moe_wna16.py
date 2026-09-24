@@ -465,6 +465,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 )
 
         self._setup_kernel(layer)
+        from vllm.model_executor.layers.fused_moe.experts import hot_tier
+
+        if hot_tier.tier_size() > 0 and hot_tier.rankings_path():
+            hot_tier.defer_layer(self, layer)
 
     def apply(
         self,

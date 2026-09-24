@@ -15,6 +15,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.experts.hot_tier import (
+    apply_split as apply_hot_tier,
+)
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
 )
@@ -647,6 +650,25 @@ class TritonWNA16Experts(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if hasattr(self, "_tier"):
+            apply_hot_tier(
+                self,
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                a1q_scale,
+                a2_scale,
+                workspace13,
+                workspace2,
+                apply_router_weight_on_input,
+            )
+            return
+
         # Check constraints.
         if self.quant_config.is_int4_w4a16_interleaved(w1):
             # N-packed int32 [E, K, N//8]: K is dim 1, not dim 2.

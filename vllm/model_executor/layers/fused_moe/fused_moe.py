@@ -73,6 +73,12 @@ def fused_moe_kernel_gptq_awq(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    # Optional two-tier expert storage. These aliases equal the hot pointers
+    # when USE_HOT_COLD_MAP is false.
+    b_cold_ptr,
+    b_scale_cold_ptr,
+    expert_hot_map_ptr,
+    expert_cold_map_ptr,
     # Matrix dimensions
     N: tl.constexpr,
     K: tl.constexpr,
@@ -92,6 +98,12 @@ def fused_moe_kernel_gptq_awq(
     stride_bse,
     stride_bsk,
     stride_bsn,
+    stride_bce,
+    stride_bck,
+    stride_bcn,
+    stride_bsce,
+    stride_bsck,
+    stride_bscn,
     stride_bze,
     stride_bzk,
     stride_bzn,
@@ -110,6 +122,7 @@ def fused_moe_kernel_gptq_awq(
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     use_int4_interleave: tl.constexpr = False,
+    USE_HOT_COLD_MAP: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -188,6 +201,26 @@ def fused_moe_kernel_gptq_awq(
         )
         return
 
+    if USE_HOT_COLD_MAP:
+        hot_expert = tl.load(expert_hot_map_ptr + off_experts).to(tl.int64)
+        cold_expert = tl.load(expert_cold_map_ptr + off_experts).to(tl.int64)
+        is_hot = hot_expert >= 0
+        selected_b_ptr = tl.where(is_hot, b_ptr, b_cold_ptr)
+        selected_scale_ptr = tl.where(is_hot, b_scale_ptr, b_scale_cold_ptr)
+        selected_expert = tl.where(is_hot, hot_expert, cold_expert)
+    else:
+        selected_b_ptr = b_ptr
+        selected_scale_ptr = b_scale_ptr
+        selected_expert = off_experts
+
+    # Both tiers store contiguous rows with identical inner layouts.
+    selected_stride_be = stride_be
+    selected_stride_bk = stride_bk
+    selected_stride_bn = stride_bn
+    selected_stride_bse = stride_bse
+    selected_stride_bsk = stride_bsk
+    selected_stride_bsn = stride_bsn
+
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (
@@ -220,10 +253,10 @@ def fused_moe_kernel_gptq_awq(
         else:
             # B: [E, N, K//2] uint8 — K-packed, 2 int4 per byte
             b_ptrs = (
-                b_ptr
-                + off_experts * stride_be
-                + (offs_k[:, None] // 2) * stride_bk
-                + offs_bn[None, :] * stride_bn
+                selected_b_ptr
+                + selected_expert * selected_stride_be
+                + (offs_k[:, None] // 2) * selected_stride_bk
+                + offs_bn[None, :] * selected_stride_bn
             )
             b_shifter = (offs_k[:, None] % 2) * 4
     elif use_int8_w8a16:
@@ -273,10 +306,10 @@ def fused_moe_kernel_gptq_awq(
         g_idx = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
 
         b_scale_ptrs = (
-            b_scale_ptr
-            + off_experts * stride_bse
-            + g_idx * stride_bsk
-            + offs_bn[None, :] * stride_bsn
+            selected_scale_ptr
+            + selected_expert * selected_stride_bse
+            + g_idx * selected_stride_bsk
+            + offs_bn[None, :] * selected_stride_bsn
         )
         b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
         b_scale = b_scale.to(tl.float32)
@@ -315,9 +348,9 @@ def fused_moe_kernel_gptq_awq(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         if use_int4_w4a16 and not use_int4_interleave:
-            b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+            b_ptrs += (BLOCK_SIZE_K // 2) * selected_stride_bk
         else:
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+            b_ptrs += BLOCK_SIZE_K * selected_stride_bk
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -724,10 +757,19 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
+    B_cold: torch.Tensor | None = None,
+    B_scale_cold: torch.Tensor | None = None,
+    expert_hot_map: torch.Tensor | None = None,
+    expert_cold_map: torch.Tensor | None = None,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
     assert block_shape is not None and block_shape[0] == 0
+    use_hot_cold_map = B_cold is not None
+    if use_hot_cold_map:
+        assert B_scale_cold is not None
+        assert expert_hot_map is not None and expert_cold_map is not None
+        assert B_zp is None, "two-tier WNA16 currently requires symmetric quantization"
 
     M = A.size(0)
     num_tokens = M * top_k
@@ -747,6 +789,28 @@ def invoke_fused_moe_wna16_triton_kernel(
         B_scale.stride(k_dim),
         B_scale.stride(n_dim),
     )
+    if use_hot_cold_map:
+        stride_bce, stride_bck, stride_bcn = (
+            B_cold.stride(0),
+            B_cold.stride(k_dim),
+            B_cold.stride(n_dim),
+        )
+        stride_bsce, stride_bsck, stride_bscn = (
+            B_scale_cold.stride(0),
+            B_scale_cold.stride(k_dim),
+            B_scale_cold.stride(n_dim),
+        )
+        assert (stride_bce, stride_bck, stride_bcn) == (stride_be, stride_bk, stride_bn)
+        assert (stride_bsce, stride_bsck, stride_bscn) == (
+            stride_bse,
+            stride_bsk,
+            stride_bsn,
+        )
+    else:
+        B_cold, B_scale_cold = B, B_scale
+        expert_hot_map = expert_cold_map = expert_ids
+        stride_bce, stride_bck, stride_bcn = stride_be, stride_bk, stride_bn
+        stride_bsce, stride_bsck, stride_bscn = stride_bse, stride_bsk, stride_bsn
     if B_zp is not None:
         stride_bze, stride_bzk, stride_bzn = (
             B_zp.stride(0),
@@ -798,6 +862,10 @@ def invoke_fused_moe_wna16_triton_kernel(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        B_cold,
+        B_scale_cold,
+        expert_hot_map,
+        expert_cold_map,
         N_out,
         A.size(1),
         EM,
@@ -812,6 +880,12 @@ def invoke_fused_moe_wna16_triton_kernel(
         stride_bse,
         stride_bsk,
         stride_bsn,
+        stride_bce,
+        stride_bck,
+        stride_bcn,
+        stride_bsce,
+        stride_bsck,
+        stride_bscn,
         stride_bze,
         stride_bzk,
         stride_bzn,
@@ -824,6 +898,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_interleave=use_int4_interleave,
+        USE_HOT_COLD_MAP=use_hot_cold_map,
         **config,
     )
 

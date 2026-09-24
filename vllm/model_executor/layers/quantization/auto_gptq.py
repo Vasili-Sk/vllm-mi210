@@ -762,6 +762,10 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         layer.w2_weight = layer.w2_qweight
 
         self._setup_kernel(layer)
+        from vllm.model_executor.layers.fused_moe.experts import hot_tier
+
+        if hot_tier.tier_size() > 0 and hot_tier.rankings_path():
+            hot_tier.build_and_attach(self, layer)
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:
         """Build the FusedMoEKernel for this layer."""

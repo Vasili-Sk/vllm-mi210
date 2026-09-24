@@ -158,6 +158,9 @@ if TYPE_CHECKING:
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_MMAP: bool = False
     VLLM_QSA_SORT_BLOCKS: bool = False
+    VLLM_WNA16_HOT_TIER_SIZE: int = 0
+    VLLM_WNA16_HOT_TIER_FILE: str | None = None
+    VLLM_WNA16_HOT_TIER_COMPACT_UVA: bool = False
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -2087,6 +2090,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_MMAP": lambda: bool(int(os.getenv("VLLM_PLE_MMAP", "0"))),
     # Sort Qwen4Exp QSA block selections during multirow execution.
     "VLLM_QSA_SORT_BLOCKS": lambda: bool(int(os.getenv("VLLM_QSA_SORT_BLOCKS", "0"))),
+    # Keep this many WNA16 experts per layer in accelerator memory.
+    "VLLM_WNA16_HOT_TIER_SIZE": lambda: int(os.getenv("VLLM_WNA16_HOT_TIER_SIZE", "0")),
+    # Read one complete expert ranking per layer from this JSON file.
+    "VLLM_WNA16_HOT_TIER_FILE": lambda: os.getenv("VLLM_WNA16_HOT_TIER_FILE"),
+    # Copy the cold tier into compact pinned host tensors.
+    "VLLM_WNA16_HOT_TIER_COMPACT_UVA": lambda: bool(
+        int(os.getenv("VLLM_WNA16_HOT_TIER_COMPACT_UVA", "0"))
+    ),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))

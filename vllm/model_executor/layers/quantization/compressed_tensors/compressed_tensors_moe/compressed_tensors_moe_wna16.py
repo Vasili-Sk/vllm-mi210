@@ -671,6 +671,10 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.w2_weight = layer.w2_weight_packed
 
         self._setup_kernel(layer)
+        from vllm.model_executor.layers.fused_moe.experts import hot_tier
+
+        if hot_tier.tier_size() > 0 and hot_tier.rankings_path():
+            hot_tier.build_and_attach(self, layer)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
