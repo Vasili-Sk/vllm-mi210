@@ -92,8 +92,7 @@ if [[ -n "$VLLM_WHEEL" ]]; then
 else
     COMMIT=$BUILDER_COMMIT
 fi
-SHORT_COMMIT=${COMMIT:0:10}
-KIT_NAME="vllm-mi210-flash-next-${SHORT_COMMIT}"
+KIT_NAME="flashnext_v1"
 if [[ -z "$SCRATCH_DIR" ]]; then
     SCRATCH_DIR="${TMPDIR:-/tmp}/$KIT_NAME-build"
 fi
